@@ -5,6 +5,7 @@
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include "secrets.h"
+#include "config.h"
 
 typedef struct {
   uint8_t frame_ctrl[2];
@@ -59,8 +60,8 @@ void snifferCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
       if (mqttClient.connected()) {
         char payload[128];
         sprintf(payload,
-          "{\"device\":\"ESP_A\",\"telefon\":%d,\"rssi\":%d,\"distance\":%.2f}",
-          i + 1, rssi, distance);
+          "{\"id\":%d,\"telefon\":%d,\"rssi\":%d,\"distance\":%.2f}",
+          DEVICENAME,i + 1, rssi, distance);
         mqttClient.publish("/devices/indoor/rssi", payload);
         Serial.println("[MQTT] Sendt: " + String(payload));
       } else {
@@ -104,7 +105,7 @@ void setup() {
   delay(200);
 
   Serial.println("========================================");
-  Serial.println("[BOOT] ESP_A starter");
+  Serial.println("[BOOT] " + String(DEVICENAME) + " starter");
   Serial.println("========================================");
 
   // Forbind WiFi og MQTT først
@@ -143,7 +144,6 @@ void loop() {
   if (millis() - lastHop > 1000) {
     channel = (channel % 13) + 1;
     esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
-    Serial.printf("[SNIFFER] Kanal → %d\n", channel);
     lastHop = millis();
   }
 }
