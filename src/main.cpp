@@ -28,10 +28,8 @@ static PubSubClient mqttClient(wifiClient);
 // ===================== KENDTE TELEFONER =====================
 uint8_t knownMACs[][6] = {
   { 0x0C, 0xE4, 0xA0, 0x77, 0x47, 0xB0 },  // Telefon 1
-  { 0x78, 0xFB, 0xD8, 0x55, 0x50, 0x40 },  // Telefon 2
-  { 0xA4, 0xC3, 0xF0, 0x12, 0x34, 0x56 },  // Telefon 3
 };
-int knownCount = 3;
+int knownCount = 1;
 
 // ===================== AFSTAND FRA RSSI =====================
 float calculateDistance(int rssi, int txPower = -59, float n = 2.5) {
