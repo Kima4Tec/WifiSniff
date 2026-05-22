@@ -1,0 +1,80 @@
+// I stedet for at filtrere på kendte MAC-adresser, tæller I alle unikke MAC-adresser I ser inden for et tidsvindue.
+
+// Gem sete MAC-adresser med tidsstempel
+struct SeenDevice {
+  uint8_t mac[6];
+  unsigned long lastSeen;
+};
+
+#define MAX_DEVICES 50
+SeenDevice seenDevices[MAX_DEVICES];
+int seenCount = 0;
+
+// Tjek om MAC er set før — og opdater tidsstempel
+bool updateSeen(uint8_t* mac) {
+  unsigned long now = millis();
+
+  // Tjek om den allerede er i listen
+  for (int i = 0; i < seenCount; i++) {
+    if (memcmp(seenDevices[i].mac, mac, 6) == 0) {
+      seenDevices[i].lastSeen = now;
+      return false;  // Ikke ny
+    }
+  }
+
+  // Ny enhed — tilføj hvis der er plads
+  if (seenCount < MAX_DEVICES) {
+    memcpy(seenDevices[seenCount].mac, mac, 6);
+    seenDevices[seenCount].lastSeen = now;
+    seenCount++;
+    return true;  // Ny enhed
+  }
+  return false;
+}
+
+// Tæl kun enheder set inden for de sidste X sekunder
+int countActive(unsigned long windowMs = 30000) {
+  unsigned long now = millis();
+  int count = 0;
+  for (int i = 0; i < seenCount; i++) {
+    if (now - seenDevices[i].lastSeen < windowMs) {
+      count++;
+    }
+  }
+  return count;
+}
+
+// Og i snifferCallback — fjern MAC-filteret og tæl alle:
+
+void snifferCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
+  if (type != WIFI_PKT_MGMT) return;  // Kun management frames
+
+  wifi_promiscuous_pkt_t* pkt = (wifi_promiscuous_pkt_t*)buf;
+  wifi_ieee80211_packet_t* ipkt = (wifi_ieee80211_packet_t*)pkt->payload;
+  wifi_ieee80211_mac_hdr_t* hdr = &ipkt->hdr;
+
+  uint8_t* mac = hdr->addr2;
+  if (mac[0] & 0x01) return;  // Filtrer broadcast
+
+  bool isNew = updateSeen(mac);
+  if (isNew) {
+    Serial.printf("[SNIFFER] Ny enhed! Aktive nu: %d\n", countActive());
+  }
+}
+
+//Og send antal til MQTT hvert 10. sekund i loop():
+
+static unsigned long lastCount = 0;
+if (millis() - lastCount > 10000) {
+  int active = countActive(30000);  // Aktive inden for 30 sek
+  char payload[128];
+  sprintf(payload,
+    "{\"device\":\"%s\",\"active_devices\":%d,\"timestamp\":\"%s\"}",
+    myName.c_str(), active, getTimestamp().c_str());
+  mqttClient.publish("/devices/indoor/count", payload);
+  Serial.printf("[MQTT] Aktive enheder: %d\n", active);
+  lastCount = millis();
+}
+
+// Tidsvinduet på 30 sekunder betyder at en enhed tæller med så længe den har sendt en pakke inden for de sidste 30 sekunder. Går den ud af rækkevidde, falder den automatisk ud af tællingen.
+// Dette er også relevant for jeres GDPR-afsnit — her indsamler I ikke MAC-adresser permanent, kun et øjebliksbillede af antal aktive enheder.
