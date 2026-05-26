@@ -1,8 +1,5 @@
 https://pentests.dk/docs/gdpr-developers-guide/
 
-Det er et rigtig vigtigt spørgsmål. MAC-adresser betragtes som personoplysninger under GDPR, fordi de kan identificere en specifik enhed og dermed en person. Her er hvad I skal tænke på:
-Hvad der gør jeres projekt følsomt
-
 Vi opsamler MAC-adresser fra personer der ikke har givet samtykke
 Vi logger position + tid, hvilket er lokaliseringsdata
 Vi transmitterer og gemmer data på en MQTT-broker
@@ -29,6 +26,6 @@ Hash MAC-adresserne inden I gemmer dem — SHA256(MAC) er ikke reversibelt og re
 Indhent eksplicit samtykke fra ejerne af de telefoner I tracker
 Begræns adgang til MQTT-brokeren og den data der gemmes
 Slet data efter projektet er afsluttet
-Dokumentér hvad I indsamler, hvorfor, og hvem der har adgang — selv en enkel side er nok til et skoleprojekt
+Dokumentér hvad vi indsamler, hvorfor, og hvem der har adgang — selv en enkel side er nok til et skoleprojekt
 
-Kort sagt: fordi I kun tracker kendte telefoner med ejernes samtykke, er I i en relativt god position — men I bør kunne dokumentere det samtykke og have en plan for datasletning.
+Kort sagt: fordi vi kun tracker kendte telefoner med ejernes samtykke, er vi i en relativt god position — men vi bør kunne dokumentere det samtykke og have en plan for datasletning.
