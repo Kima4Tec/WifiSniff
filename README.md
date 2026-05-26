@@ -1068,6 +1068,7 @@ void loop() {
   }
 }
 
+
 ```
 
 ## Heatmap men mangler websocket port til mqtt-server
@@ -1363,7 +1364,7 @@ client.on('error', (e) => console.log('Fejl:', e));
     <div class="field">
       <label>WebSocket URL</label>
       <!-- SKIFT PORT HER — typisk 9001 (Mosquitto) eller 8083 (EMQX) -->
-      <input id="inp-url" type="text" value="wss://DIN_BROKER:9001">
+      <input id="inp-url" type="text" value="wss://192.168.0.161:8080">
     </div>
     <div class="field">
       <label>Brugernavn</label>
@@ -1679,6 +1680,7 @@ requestAnimationFrame(draw);
 </script>
 </body>
 </html>
+
 
 
 ```
