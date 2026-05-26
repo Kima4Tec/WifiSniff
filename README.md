@@ -396,7 +396,7 @@ Sikkerheden øges markant sammenlignet med ren SHA-256 hashing.
 // ===================== CONFIG =====================
 // Sæt dette til "slaveA" eller "slaveB" i config.h som SLAVE_ID
 // Topic bliver: /sensors/raw/slaveA  eller  /sensors/raw/slaveB
-#define MQTT_TOPIC_PREFIX "/sensors/raw/"
+#define MQTT_TOPIC_PREFIX "devices/device03/raw/"
 
 // Slave-position i rummet (meter) — sæt i config.h som SLAVE_X og SLAVE_Y
 // Bruges af master til triangulering
@@ -672,9 +672,9 @@ void loop() {
 #include "ca_cert.h"   // MQTT_CA_CERT
 
 // ===================== CONFIG =====================
-#define TOPIC_SLAVE_A    "/sensors/raw/slaveA"
-#define TOPIC_SLAVE_B    "/sensors/raw/slaveB"
-#define TOPIC_POSITIONS  "/devices/positions"
+#define TOPIC_SLAVE_A    "devices/device03/raw/slaveA"
+#define TOPIC_SLAVE_B    "devices/device03/raw/slaveB"
+#define TOPIC_POSITIONS  "devices/device03/positions"
 
 // Tidsvindue for at kombinere målinger fra begge slaves (ms)
 // Målinger der er ældre end dette kasseres
