@@ -15,7 +15,7 @@ Vi opstartede desuden nyt projekt, hvor vi undersøger mulighederne med esp-now.
 ### Dag 3
 
 ---
-```md
+
 # Sammenligning af teknologier til indoor positioning med ESP32
 
 | Teknologi | Hvordan virker det? | Fordele | Ulemper | Egnet til projektet? |
@@ -25,7 +25,7 @@ Vi opstartede desuden nyt projekt, hvor vi undersøger mulighederne med esp-now.
 | ESP-MESH | ESP32’er danner selvorganiserende mesh-netværk og videresender data mellem noder til root-node | Stor rækkevidde, selvhelende netværk, god til store områder, robust mod node-fejl | Kompleks opsætning, højere latency, mere RAM/CPU-forbrug, svær debugging | Muligt, men ofte overkill til mindre projekter |
 | RTT (Round Trip Time) | Måler tiden et signal bruger på at rejse mellem enheder og tilbage igen | Potentielt mere præcis afstandsbestemmelse end RSSI | ESP32 understøtter ikke præcis hardware-timing til RTT/Fine Timing Measurement (FTM), meget vanskelig implementering, kræver synkronisering | Ikke realistisk til dette projekt |
 | RSSI-triangulering | Afstand estimeres ud fra signalstyrke (RSSI), hvorefter position beregnes geometrisk | Simpel implementering, virker med standard ESP32 hardware, ingen aktiv forbindelse nødvendig | Lav præcision, påvirkes af vægge, mennesker og støj, signalstyrke varierer meget | Ja – mest realistiske metode med ESP32 |
-```
+
 
 Valget faldt først på direkte mqtt-arkitektur
 
