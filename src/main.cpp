@@ -5,9 +5,12 @@
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <WiFiClientSecure.h>
+#include <set>
+#include <string>
 #include "secrets.h"
 #include "config.h"
 #include "ca_cert.h"
+#include "mbedtls/sha256.h"
 
 typedef struct {
   uint8_t frame_ctrl[2];
@@ -24,13 +27,14 @@ typedef struct {
 } wifi_ieee80211_packet_t;
 
 // ===================== DETECTION QUEUE =====================
-// ISR-safe queue: sniffer writes here, loop() publishes
 #define QUEUE_SIZE 16
 
 typedef struct {
-  int     phoneIndex;
+  char    anonId[65];
   int8_t  rssi;
   float   distance;
+  bool    isKnown;
+  int     knownIndex; // index i knownMACs
 } DetectionEvent;
 
 static DetectionEvent eventQueue[QUEUE_SIZE];
@@ -40,21 +44,28 @@ static volatile int   queueTail = 0;
 static inline bool queueFull()  { return ((queueTail + 1) % QUEUE_SIZE) == queueHead; }
 static inline bool queueEmpty() { return queueHead == queueTail; }
 
-// Called from ISR — only enqueue, no Serial/MQTT
-static inline void enqueueEvent(int phoneIdx, int8_t rssi, float distance) {
+static inline void enqueueEvent(const char* anonId, int8_t rssi, float distance, bool isKnown, int knownIndex) {
   if (!queueFull()) {
-    eventQueue[queueTail] = { phoneIdx, rssi, distance };
+    strncpy(eventQueue[queueTail].anonId, anonId, 65);
+    eventQueue[queueTail].rssi       = rssi;
+    eventQueue[queueTail].distance   = distance;
+    eventQueue[queueTail].isKnown    = isKnown;
+    eventQueue[queueTail].knownIndex = knownIndex;
     queueTail = (queueTail + 1) % QUEUE_SIZE;
   }
 }
 
-// Called from loop() — safe to use Serial/MQTT
 static bool dequeueEvent(DetectionEvent* out) {
   if (queueEmpty()) return false;
   *out = eventQueue[queueHead];
   queueHead = (queueHead + 1) % QUEUE_SIZE;
   return true;
 }
+
+// ===================== DEVICE TRACKING =====================
+static std::set<std::string> seenDevices;
+static unsigned long lastPublishTime = 0;
+#define PUBLISH_INTERVAL_MS (30UL * 1000UL) // 30 sekunder
 
 // ===================== DEVICE IDENTITY =====================
 String myName = "UNKNOWN";
@@ -69,6 +80,21 @@ String getTimestamp() {
     strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%S", &timeinfo);
   }
   return String(timestamp);
+}
+
+// ===================== HASH MAC =====================
+void hashMAC(uint8_t* mac, char* output) {
+  uint8_t input[6 + 20];
+  memcpy(input, mac, 6);
+  memcpy(input + 6, SALT, strlen(SALT));
+
+  byte hash[32];
+  mbedtls_sha256_ret(input, 6 + strlen(SALT), hash, 0);
+
+  for (int i = 0; i < 32; i++) {
+    sprintf(output + i * 2, "%02x", hash[i]);
+  }
+  output[64] = '\0';
 }
 
 // ===================== MQTT (med TLS) =====================
@@ -102,7 +128,6 @@ void espId() {
 }
 
 // ===================== SNIFFER CALLBACK =====================
-// Runs in ISR context — NO Serial, NO MQTT, NO getLocalTime here
 void IRAM_ATTR snifferCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
   if (type != WIFI_PKT_MGMT && type != WIFI_PKT_DATA) return;
 
@@ -113,15 +138,24 @@ void IRAM_ATTR snifferCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
   uint8_t* mac = hdr->addr2;
   if (mac[0] & 0x01) return;  // Filtrer broadcast/multicast
 
-  int8_t rssi = pkt->rx_ctrl.rssi;
+  int8_t rssi     = pkt->rx_ctrl.rssi;
+  float distance  = calculateDistance(rssi);
 
-  for (int i = 0; i < knownCount; i++) {
+  // Tjek om det er en known device
+  bool isKnown    = false;
+  int knownIndex  = -1;
+  for (int i = 0; i < knownMACCount; i++) {
     if (memcmp(mac, knownMACs[i], 6) == 0) {
-      float distance = calculateDistance(rssi);
-      enqueueEvent(i, rssi, distance);
-      return;
+      isKnown    = true;
+      knownIndex = i;
+      break;
     }
   }
+
+  char anonId[65];
+  hashMAC(mac, anonId);
+
+  enqueueEvent(anonId, rssi, distance, isKnown, knownIndex);
 }
 
 // ===================== WIFI =====================
@@ -169,21 +203,20 @@ void setup() {
 
   tlsClient.setCACert(MQTT_CA_CERT);
   mqttClient.setServer(MQTT_HOST, MQTT_PORT);
-  mqttClient.setBufferSize(512);  // Ensure payload fits with MQTT overhead
+  mqttClient.setBufferSize(512);
 
   espId();
   reconnectMQTT();
 
-  // Synkroniser tid
   configTime(0, 0, "pool.ntp.org");
   setenv("TZ", "CET-1CEST,M3.5.0,M10.5.0/3", 1);
   tzset();
 
-  // Wait briefly for NTP to sync
   delay(1500);
   Serial.println("[NTP] Tid synkroniseret");
 
-  // Start sniffer — WiFi forbliver forbundet
+  lastPublishTime = millis();
+
   esp_wifi_set_promiscuous(true);
   esp_wifi_set_promiscuous_rx_cb(&snifferCallback);
   esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
@@ -194,39 +227,64 @@ void setup() {
 
 // ===================== LOOP =====================
 void loop() {
-  // Hold MQTT forbindelsen i live
   if (!mqttClient.connected()) {
     Serial.println("[MQTT] Forbindelse tabt — genopretter...");
     reconnectMQTT();
   }
   mqttClient.loop();
 
-  // Drain detection queue and publish
+  // Drain detection queue
   DetectionEvent evt;
   while (dequeueEvent(&evt)) {
-    Serial.printf("[SNIFFER] Telefon %d — RSSI: %d dBm  ~%.1f m\n",
-      evt.phoneIndex + 1, evt.rssi, evt.distance);
+    seenDevices.insert(std::string(evt.anonId));
 
-    if (mqttClient.connected()) {
-      char payload[256];
-      int len = snprintf(payload, sizeof(payload),
-        "{\"device\":\"%s\",\"x\":%.1f,\"y\":%.1f,\"telefon\":%d,\"rssi\":%d,\"distance\":%.2f,\"timestamp\":\"%s\"}",
-        myName.c_str(), myX, myY,
-        evt.phoneIndex + 1, evt.rssi, evt.distance,
-        getTimestamp().c_str());
+    Serial.printf("[SNIFFER] Device %s — RSSI: %d dBm  ~%.1f m%s\n",
+      evt.anonId,
+      evt.rssi,
+      evt.distance,
+      evt.isKnown ? "  *** KNOWN DEVICE ***" : ""
+    );
 
-      if (len >= (int)sizeof(payload)) {
-        Serial.println("[MQTT] ADVARSEL: payload afkortet!");
-      }
-
-      mqttClient.publish("/devices/device03", payload);
-      Serial.println("[MQTT] Sendt: " + String(payload));
-    } else {
-      Serial.println("[MQTT] Ikke forbundet — kan ikke sende");
+    // Publicer known device med det samme — med eget topic
+    if (evt.isKnown && mqttClient.connected()) {
+      char payload[192];
+      snprintf(payload, sizeof(payload),
+        "{\"device\":\"%s\",\"rssi\":%d,\"distance\":%.2f,\"timestamp\":\"%s\"}",
+        knownNames[evt.knownIndex],
+        evt.rssi,
+        evt.distance,
+        getTimestamp().c_str()
+      );
+      String topic = "/devices/device03/" + myName + "/known";
+      mqttClient.publish(topic.c_str(), payload);
+      Serial.println("[MQTT] Known device sendt: " + String(payload));
     }
   }
 
-  // Channel hopping — disable sniffer briefly to avoid mid-hop callbacks
+  // ===================== RAPPORT HVERT 30. SEK =====================
+  if (millis() - lastPublishTime >= PUBLISH_INTERVAL_MS) {
+    if (mqttClient.connected()) {
+      char payload[128];
+      snprintf(payload, sizeof(payload),
+        "{\"node\":\"%s\",\"x\":%.1f,\"y\":%.1f,\"unique_devices\":%d,\"timestamp\":\"%s\"}",
+        myName.c_str(),
+        myX,
+        myY,
+        (int)seenDevices.size(),
+        getTimestamp().c_str()
+      );
+      String topic = "/devices/device03/" + myName + "/count";
+      mqttClient.publish(topic.c_str(), payload);
+      Serial.printf("[MQTT] Rapport sendt: %d unikke enheder\n", (int)seenDevices.size());
+      Serial.println("[MQTT] Payload: " + String(payload));
+    } else {
+      Serial.println("[MQTT] Rapport — ikke forbundet, kan ikke sende");
+    }
+    seenDevices.clear();
+    lastPublishTime = millis();
+  }
+
+  // Channel hopping
   static uint8_t        channel = 1;
   static unsigned long  lastHop = 0;
 
