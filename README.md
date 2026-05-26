@@ -978,3 +978,615 @@ void loop() {
   }
 }
 ```
+
+## Heatmap men mangler websocket port til mqtt-server
+test port 9001 eller  9883 
+```
+const client = mqtt.connect('wss://DIN_BROKER:9001', {
+  username: 'DIN_USER',
+  password: 'DIN_PASS'
+});
+client.on('connect', () => console.log('Forbundet!'));
+client.on('error', (e) => console.log('Fejl:', e));
+```
+
+## Html-kode til heatmap
+```
+<!DOCTYPE html>
+<html lang="da">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Positionsoverblik</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mqtt/5.3.4/mqtt.min.js"></script>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:wght@300;400;500&display=swap');
+
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg:       #0e1117;
+    --surface:  #161b24;
+    --border:   #242b38;
+    --text:     #c8d0e0;
+    --muted:    #4a5568;
+    --accent:   #3b82f6;
+    --online:   #22c55e;
+    --warn:     #f59e0b;
+    --danger:   #ef4444;
+
+    /* Rum-dimensioner i meter — tilpas til jeres rum */
+    --room-w-m: 10;
+    --room-h-m: 8;
+  }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'DM Sans', sans-serif;
+    font-size: 14px;
+    min-height: 100vh;
+    display: grid;
+    grid-template-rows: 48px 1fr;
+    grid-template-columns: 1fr 280px;
+    grid-template-areas: "header header" "canvas sidebar";
+  }
+
+  /* ── HEADER ── */
+  header {
+    grid-area: header;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 0 20px;
+  }
+
+  header h1 {
+    font-family: 'DM Mono', monospace;
+    font-size: 13px;
+    font-weight: 500;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+    color: var(--text);
+  }
+
+  #conn-badge {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-family: 'DM Mono', monospace;
+    font-size: 11px;
+    color: var(--muted);
+  }
+
+  #conn-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--muted);
+    transition: background .4s;
+  }
+
+  #conn-dot.online  { background: var(--online); box-shadow: 0 0 6px var(--online); }
+  #conn-dot.error   { background: var(--danger);  box-shadow: 0 0 6px var(--danger); }
+
+  #msg-count {
+    margin-left: auto;
+    font-family: 'DM Mono', monospace;
+    font-size: 11px;
+    color: var(--muted);
+  }
+
+  /* ── CANVAS AREA ── */
+  #canvas-wrap {
+    grid-area: canvas;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+    overflow: hidden;
+  }
+
+  #room-canvas {
+    border: 1px solid var(--border);
+    background: var(--surface);
+    display: block;
+    cursor: crosshair;
+  }
+
+  /* ── SIDEBAR ── */
+  aside {
+    grid-area: sidebar;
+    background: var(--surface);
+    border-left: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  .sidebar-section {
+    padding: 16px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .sidebar-section h2 {
+    font-family: 'DM Mono', monospace;
+    font-size: 10px;
+    font-weight: 500;
+    letter-spacing: .12em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin-bottom: 12px;
+  }
+
+  /* Connection config */
+  .field { margin-bottom: 10px; }
+  .field label {
+    display: block;
+    font-size: 11px;
+    color: var(--muted);
+    margin-bottom: 4px;
+    font-family: 'DM Mono', monospace;
+  }
+
+  .field input {
+    width: 100%;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--text);
+    font-family: 'DM Mono', monospace;
+    font-size: 12px;
+    padding: 6px 8px;
+    outline: none;
+    transition: border-color .2s;
+  }
+  .field input:focus { border-color: var(--accent); }
+
+  #btn-connect {
+    width: 100%;
+    padding: 8px;
+    background: var(--accent);
+    color: #fff;
+    border: none;
+    border-radius: 4px;
+    font-family: 'DM Mono', monospace;
+    font-size: 12px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: opacity .2s;
+    margin-top: 4px;
+  }
+  #btn-connect:hover { opacity: .85; }
+
+  /* Device list */
+  #device-list {
+    flex: 1;
+    overflow-y: auto;
+    padding: 12px 16px;
+    scrollbar-width: thin;
+    scrollbar-color: var(--border) transparent;
+  }
+
+  .dev-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 10px;
+    border-radius: 6px;
+    margin-bottom: 6px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    transition: border-color .3s;
+    animation: fadeIn .3s ease;
+  }
+
+  .dev-item.fresh { border-color: var(--accent); }
+
+  @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+
+  .dev-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+
+  .dev-info { flex: 1; min-width: 0; }
+
+  .dev-id {
+    font-family: 'DM Mono', monospace;
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--text);
+  }
+
+  .dev-pos {
+    font-family: 'DM Mono', monospace;
+    font-size: 10px;
+    color: var(--muted);
+    margin-top: 2px;
+  }
+
+  .dev-age {
+    font-family: 'DM Mono', monospace;
+    font-size: 10px;
+    color: var(--muted);
+    flex-shrink: 0;
+  }
+
+  /* Slave positions legend */
+  .slave-tag {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font-family: 'DM Mono', monospace;
+    font-size: 11px;
+    color: var(--muted);
+    margin-right: 10px;
+  }
+
+  .slave-icon {
+    width: 8px; height: 8px;
+    border-radius: 2px;
+    background: #f59e0b;
+    display: inline-block;
+  }
+
+  #btn-clear {
+    background: none;
+    border: 1px solid var(--border);
+    color: var(--muted);
+    border-radius: 4px;
+    font-family: 'DM Mono', monospace;
+    font-size: 11px;
+    padding: 5px 10px;
+    cursor: pointer;
+    transition: border-color .2s, color .2s;
+    width: 100%;
+    margin-top: 4px;
+  }
+  #btn-clear:hover { border-color: var(--danger); color: var(--danger); }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Positionsoverblik</h1>
+  <div id="conn-badge">
+    <div id="conn-dot"></div>
+    <span id="conn-label">Ikke forbundet</span>
+  </div>
+  <span id="msg-count">0 beskeder</span>
+</header>
+
+<div id="canvas-wrap">
+  <canvas id="room-canvas"></canvas>
+</div>
+
+<aside>
+  <div class="sidebar-section">
+    <h2>Broker</h2>
+    <div class="field">
+      <label>WebSocket URL</label>
+      <!-- SKIFT PORT HER — typisk 9001 (Mosquitto) eller 8083 (EMQX) -->
+      <input id="inp-url" type="text" value="wss://DIN_BROKER:9001">
+    </div>
+    <div class="field">
+      <label>Brugernavn</label>
+      <input id="inp-user" type="text" value="">
+    </div>
+    <div class="field">
+      <label>Adgangskode</label>
+      <input id="inp-pass" type="password" value="">
+    </div>
+    <div class="field">
+      <label>Topic</label>
+      <input id="inp-topic" type="text" value="devices/device03/positions">
+    </div>
+    <button id="btn-connect">Forbind</button>
+  </div>
+
+  <div class="sidebar-section">
+    <h2>Rum (meter)</h2>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
+      <div class="field" style="margin:0">
+        <label>Bredde</label>
+        <input id="inp-rw" type="number" value="10" min="1" max="100">
+      </div>
+      <div class="field" style="margin:0">
+        <label>Dybde</label>
+        <input id="inp-rh" type="number" value="8" min="1" max="100">
+      </div>
+    </div>
+  </div>
+
+  <div class="sidebar-section">
+    <h2>Enheder <span id="dev-count" style="color:var(--accent);font-size:12px"></span></h2>
+    <div class="slave-tag"><span class="slave-icon"></span> Slave-position</div>
+  </div>
+
+  <div id="device-list"></div>
+
+  <div class="sidebar-section">
+    <button id="btn-clear">Ryd alle enheder</button>
+  </div>
+</aside>
+
+<script>
+// ── CONFIG ──────────────────────────────────────────────────
+const FADE_MS      = 15000;  // Enhed forsvinder efter 15 sek uden opdatering
+const HEATMAP_DECAY = 0.97;  // Heatmap falmer langsomt (pr. frame)
+const DOT_RADIUS   = 14;     // Pixels
+
+// Slave-positioner i meter — skal matche SLAVE_X/SLAVE_Y i config.h
+const SLAVES = [
+  { id: 'slaveA', x: 0.0, y: 0.0, color: '#f59e0b' },
+  { id: 'slaveB', x: 5.0, y: 0.0, color: '#f59e0b' },
+];
+
+// ── STATE ────────────────────────────────────────────────────
+let devices   = {};   // devId → { x, y, lastSeen, color }
+let mqttClient = null;
+let msgCount  = 0;
+
+// Heatmap offscreen canvas
+let heatCanvas, heatCtx;
+
+// ── CANVAS SETUP ─────────────────────────────────────────────
+const canvas = document.getElementById('room-canvas');
+const ctx    = canvas.getContext('2d');
+
+function roomDims() {
+  return {
+    wM: parseFloat(document.getElementById('inp-rw').value) || 10,
+    hM: parseFloat(document.getElementById('inp-rh').value) || 8,
+  };
+}
+
+function resizeCanvas() {
+  const wrap = document.getElementById('canvas-wrap');
+  const { wM, hM } = roomDims();
+  const aspect = wM / hM;
+  const maxW   = wrap.clientWidth  - 48;
+  const maxH   = wrap.clientHeight - 48;
+  let w = maxW, h = maxW / aspect;
+  if (h > maxH) { h = maxH; w = h * aspect; }
+  canvas.width  = Math.floor(w);
+  canvas.height = Math.floor(h);
+
+  heatCanvas        = document.createElement('canvas');
+  heatCanvas.width  = canvas.width;
+  heatCanvas.height = canvas.height;
+  heatCtx           = heatCanvas.getContext('2d');
+}
+
+function mToPx(xM, yM) {
+  const { wM, hM } = roomDims();
+  return {
+    px: (xM / wM) * canvas.width,
+    py: (yM / hM) * canvas.height,
+  };
+}
+
+// ── COLOR POOL ───────────────────────────────────────────────
+const COLOR_POOL = [
+  '#3b82f6','#8b5cf6','#ec4899','#06b6d4',
+  '#10b981','#f97316','#ef4444','#a3e635',
+];
+let colorIdx = 0;
+function nextColor() { return COLOR_POOL[colorIdx++ % COLOR_POOL.length]; }
+
+// ── DRAW ─────────────────────────────────────────────────────
+function draw() {
+  const now = Date.now();
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  // Heatmap fade
+  heatCtx.globalAlpha = HEATMAP_DECAY;
+  heatCtx.globalCompositeOperation = 'destination-out';
+  heatCtx.fillRect(0, 0, heatCanvas.width, heatCanvas.height);
+  heatCtx.globalCompositeOperation = 'source-over';
+  heatCtx.globalAlpha = 1;
+
+  // Draw heatmap layer
+  ctx.drawImage(heatCanvas, 0, 0);
+
+  // Grid
+  ctx.strokeStyle = '#1e2530';
+  ctx.lineWidth   = 1;
+  const { wM, hM } = roomDims();
+  for (let x = 0; x <= wM; x++) {
+    const px = (x / wM) * canvas.width;
+    ctx.beginPath(); ctx.moveTo(px, 0); ctx.lineTo(px, canvas.height); ctx.stroke();
+  }
+  for (let y = 0; y <= hM; y++) {
+    const py = (y / hM) * canvas.height;
+    ctx.beginPath(); ctx.moveTo(0, py); ctx.lineTo(canvas.width, py); ctx.stroke();
+  }
+
+  // Axis labels
+  ctx.fillStyle = '#2a3444';
+  ctx.font = '10px DM Mono, monospace';
+  ctx.textAlign = 'center';
+  for (let x = 0; x <= wM; x++) {
+    const px = (x / wM) * canvas.width;
+    ctx.fillText(x + 'm', px, canvas.height - 4);
+  }
+  ctx.textAlign = 'right';
+  for (let y = 0; y <= hM; y++) {
+    const py = (y / hM) * canvas.height;
+    ctx.fillText(y + 'm', 22, py + 4);
+  }
+
+  // Slave positions
+  SLAVES.forEach(s => {
+    const { px, py } = mToPx(s.x, s.y);
+    ctx.fillStyle = '#f59e0b';
+    ctx.beginPath();
+    ctx.rect(px - 6, py - 6, 12, 12);
+    ctx.fill();
+    ctx.fillStyle = '#0e1117';
+    ctx.font = 'bold 8px DM Mono, monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('S', px, py + 3);
+    ctx.fillStyle = '#f59e0b';
+    ctx.font = '10px DM Mono, monospace';
+    ctx.fillText(s.id, px, py - 10);
+  });
+
+  // Devices
+  Object.values(devices).forEach(dev => {
+    const age    = now - dev.lastSeen;
+    if (age > FADE_MS) return;
+    const alpha  = 1 - age / FADE_MS;
+    const { px, py } = mToPx(dev.x, dev.y);
+
+    // Heatmap blob
+    const grad = heatCtx.createRadialGradient(px, py, 0, px, py, DOT_RADIUS * 3);
+    grad.addColorStop(0, dev.color + '55');
+    grad.addColorStop(1, dev.color + '00');
+    heatCtx.fillStyle = grad;
+    heatCtx.beginPath();
+    heatCtx.arc(px, py, DOT_RADIUS * 3, 0, Math.PI * 2);
+    heatCtx.fill();
+
+    // Dot
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle   = dev.color;
+    ctx.beginPath();
+    ctx.arc(px, py, DOT_RADIUS * 0.6, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Puls-ring
+    const pulse = ((now % 1600) / 1600);
+    ctx.strokeStyle = dev.color;
+    ctx.lineWidth   = 1.5;
+    ctx.globalAlpha = alpha * (1 - pulse);
+    ctx.beginPath();
+    ctx.arc(px, py, DOT_RADIUS * 0.6 + pulse * DOT_RADIUS * 1.5, 0, Math.PI * 2);
+    ctx.stroke();
+
+    // Label
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle   = dev.color;
+    ctx.font        = '11px DM Mono, monospace';
+    ctx.textAlign   = 'center';
+    ctx.fillText(dev.id, px, py - DOT_RADIUS - 4);
+
+    ctx.globalAlpha = 1;
+  });
+
+  requestAnimationFrame(draw);
+}
+
+// ── SIDEBAR DEVICE LIST ──────────────────────────────────────
+function updateSidebar() {
+  const now   = Date.now();
+  const list  = document.getElementById('device-list');
+  const count = document.getElementById('dev-count');
+  const active = Object.values(devices).filter(d => now - d.lastSeen < FADE_MS);
+  count.textContent = active.length ? `(${active.length})` : '';
+
+  list.innerHTML = active.length === 0
+    ? `<p style="color:var(--muted);font-size:12px;font-family:'DM Mono',monospace;padding:8px 0">Ingen enheder fundet endnu</p>`
+    : active.sort((a,b) => b.lastSeen - a.lastSeen).map(dev => {
+        const secs  = Math.round((now - dev.lastSeen) / 1000);
+        const fresh = secs < 3;
+        return `<div class="dev-item ${fresh ? 'fresh' : ''}">
+          <div class="dev-dot" style="background:${dev.color}"></div>
+          <div class="dev-info">
+            <div class="dev-id">${dev.id}</div>
+            <div class="dev-pos">(${dev.x.toFixed(2)}m, ${dev.y.toFixed(2)}m)</div>
+          </div>
+          <div class="dev-age">${secs}s</div>
+        </div>`;
+      }).join('');
+}
+
+setInterval(updateSidebar, 1000);
+
+// ── MQTT ─────────────────────────────────────────────────────
+function connect() {
+  if (mqttClient) { try { mqttClient.end(true); } catch(e){} }
+
+  const url   = document.getElementById('inp-url').value.trim();
+  const user  = document.getElementById('inp-user').value.trim();
+  const pass  = document.getElementById('inp-pass').value;
+  const topic = document.getElementById('inp-topic').value.trim();
+
+  setStatus('connecting', 'Forbinder...');
+
+  const opts = { clientId: 'heatmap-' + Math.random().toString(16).slice(2) };
+  if (user) { opts.username = user; opts.password = pass; }
+
+  mqttClient = mqtt.connect(url, opts);
+
+  mqttClient.on('connect', () => {
+    setStatus('online', 'Forbundet');
+    mqttClient.subscribe(topic, err => {
+      if (err) console.error('[MQTT] Subscribe fejl:', err);
+    });
+  });
+
+  mqttClient.on('error', err => {
+    setStatus('error', 'Fejl: ' + (err.message || err));
+  });
+
+  mqttClient.on('close', () => setStatus('', 'Afbrudt'));
+
+  mqttClient.on('message', (t, payload) => {
+    msgCount++;
+    document.getElementById('msg-count').textContent = msgCount + ' beskeder';
+
+    try {
+      const msg = JSON.parse(payload.toString());
+      const { devId, x, y } = msg;
+      if (!devId || x == null || y == null) return;
+
+      if (!devices[devId]) {
+        devices[devId] = { id: devId, color: nextColor() };
+      }
+      devices[devId].x        = parseFloat(x);
+      devices[devId].y        = parseFloat(y);
+      devices[devId].lastSeen = Date.now();
+    } catch(e) {
+      console.warn('[MQTT] Ugyldig JSON:', payload.toString());
+    }
+  });
+}
+
+function setStatus(state, label) {
+  const dot = document.getElementById('conn-dot');
+  const lbl = document.getElementById('conn-label');
+  dot.className = state;
+  lbl.textContent = label;
+}
+
+// ── EVENTS ───────────────────────────────────────────────────
+document.getElementById('btn-connect').addEventListener('click', connect);
+
+document.getElementById('btn-clear').addEventListener('click', () => {
+  devices = {};
+  heatCtx && heatCtx.clearRect(0, 0, heatCanvas.width, heatCanvas.height);
+  updateSidebar();
+});
+
+['inp-rw','inp-rh'].forEach(id => {
+  document.getElementById(id).addEventListener('change', () => { resizeCanvas(); });
+});
+
+window.addEventListener('resize', resizeCanvas);
+
+// ── INIT ─────────────────────────────────────────────────────
+resizeCanvas();
+requestAnimationFrame(draw);
+</script>
+</body>
+</html>
+
+```
+
+
