@@ -662,6 +662,7 @@ void loop() {
 ### Kode til Master
 ```
 #include "Arduino.h"
+#include "esp_wifi.h"
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <WiFiClientSecure.h>
@@ -676,38 +677,17 @@ void loop() {
 #define TOPIC_SLAVE_B    "devices/device03/raw/slaveB"
 #define TOPIC_POSITIONS  "devices/device03/positions"
 
-// Tidsvindue for at kombinere målinger fra begge slaves (ms)
-// Målinger der er ældre end dette kasseres
-#define WINDOW_MS        2000
+// Master-position i rummet (meter)
+#define MASTER_X   0.0f
+#define MASTER_Y   5.0f
 
-// Minimum RSSI for at tage en måling med (-85 dBm er typisk grænse for brugbar signal)
-#define MIN_RSSI         -85
+#define WINDOW_MS   2000   // Tidsvindue for at kombinere målinger (ms)
+#define MIN_RSSI    -85    // Svageste signal der accepteres
+#define MAX_DEVICES  40
+#define THROTTLE_MS  500   // Maks én måling per enhed per interval (master sniffer)
 
-// Maks antal samtidige enheder vi tracker
-#define MAX_DEVICES      40
-
-// Dagligt salt til anonymisering — skiftes automatisk ved midnat
-// Gør at samme MAC giver forskelligt devId fra dag til dag
+// ===================== DAGLIGT SALT =====================
 static char dailySalt[16] = "SALT_INIT";
-
-// ===================== ANONYMISERING =====================
-// SHA256(macHash + dagligSalt) → 4 tegn brugt som "DEV-XXXX"
-// macHash kommer allerede hashet fra slaven — dobbelthashning
-void makeDevId(const char* macHash, char* outDevId) {
-  char input[32];
-  snprintf(input, sizeof(input), "%s%s", macHash, dailySalt);
-
-  uint8_t digest[32];
-  mbedtls_md_context_t ctx;
-  mbedtls_md_init(&ctx);
-  mbedtls_md_setup(&ctx, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), 0);
-  mbedtls_md_starts(&ctx);
-  mbedtls_md_update(&ctx, (const uint8_t*)input, strlen(input));
-  mbedtls_md_finish(&ctx, digest);
-  mbedtls_md_free(&ctx);
-
-  snprintf(outDevId, 10, "DEV-%02X%02X", digest[0], digest[1]);
-}
 
 void updateDailySalt() {
   struct tm t;
@@ -717,27 +697,57 @@ void updateDailySalt() {
   }
 }
 
+// ===================== ANONYMISERING =====================
+void makeDevId(const char* macHash, char* outDevId) {
+  char input[32];
+  snprintf(input, sizeof(input), "%s%s", macHash, dailySalt);
+  uint8_t digest[32];
+  mbedtls_md_context_t ctx;
+  mbedtls_md_init(&ctx);
+  mbedtls_md_setup(&ctx, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), 0);
+  mbedtls_md_starts(&ctx);
+  mbedtls_md_update(&ctx, (const uint8_t*)input, strlen(input));
+  mbedtls_md_finish(&ctx, digest);
+  mbedtls_md_free(&ctx);
+  snprintf(outDevId, 10, "DEV-%02X%02X", digest[0], digest[1]);
+}
+
+// ===================== MAC HASH =====================
+void macToHash(const uint8_t* mac, char* outHex8) {
+  uint8_t digest[32];
+  mbedtls_md_context_t ctx;
+  mbedtls_md_init(&ctx);
+  mbedtls_md_setup(&ctx, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), 0);
+  mbedtls_md_starts(&ctx);
+  mbedtls_md_update(&ctx, mac, 6);
+  mbedtls_md_finish(&ctx, digest);
+  mbedtls_md_free(&ctx);
+  snprintf(outHex8, 9, "%02X%02X%02X%02X",
+    digest[0], digest[1], digest[2], digest[3]);
+}
+
 // ===================== DEVICE TABLE =====================
-// Holder seneste måling fra hver slave per enhed
 typedef struct {
   char          macHash[9];
   char          devId[10];
 
   // Slave A måling
-  float         axPos;
-  float         ayPos;
+  float         axPos, ayPos;
   int8_t        aRssi;
   unsigned long aTime;
 
   // Slave B måling
-  float         bxPos;
-  float         byPos;
+  float         bxPos, byPos;
   int8_t        bRssi;
   unsigned long bTime;
 
+  // Master (lokal) måling
+  float         mxPos, myPos;
+  int8_t        mRssi;
+  unsigned long mTime;
+
   // Beregnet position
-  float         estX;
-  float         estY;
+  float         estX, estY;
   bool          published;
 } DeviceEntry;
 
@@ -749,11 +759,10 @@ DeviceEntry* findOrCreate(const char* macHash) {
     if (strcmp(devices[i].macHash, macHash) == 0) return &devices[i];
   }
   if (deviceCount >= MAX_DEVICES) {
-    // Udskift den ældste entry (simpel LRU: find entry med ældst timestamp)
     int oldest = 0;
     unsigned long minTime = ULONG_MAX;
     for (int i = 0; i < MAX_DEVICES; i++) {
-      unsigned long t = max(devices[i].aTime, devices[i].bTime);
+      unsigned long t = max({devices[i].aTime, devices[i].bTime, devices[i].mTime});
       if (t < minTime) { minTime = t; oldest = i; }
     }
     memset(&devices[oldest], 0, sizeof(DeviceEntry));
@@ -769,36 +778,100 @@ DeviceEntry* findOrCreate(const char* macHash) {
 }
 
 // ===================== TRIANGULERING =====================
-// Weighted centroid baseret på RSSI
-// Jo stærkere signal (højere RSSI), jo mere vægt
-// Kræver minimum én måling — publicerer med én slave hvis kun én ser enheden
+// Weighted centroid fra op til 3 punkter
+// Vægt = 1 / distance² — stærkt signal trækker mere
 
 float rssiToDistance(int8_t rssi, int txPower = -59, float n = 2.5) {
-  return pow(10.0, (txPower - rssi) / (10.0 * n));
+  return pow(10.0f, (txPower - rssi) / (10.0f * n));
 }
 
 bool triangulate(DeviceEntry* dev, float* outX, float* outY) {
   unsigned long now = millis();
   bool hasA = (dev->aTime > 0) && ((now - dev->aTime) < WINDOW_MS) && (dev->aRssi > MIN_RSSI);
   bool hasB = (dev->bTime > 0) && ((now - dev->bTime) < WINDOW_MS) && (dev->bRssi > MIN_RSSI);
+  bool hasM = (dev->mTime > 0) && ((now - dev->mTime) < WINDOW_MS) && (dev->mRssi > MIN_RSSI);
 
-  if (!hasA && !hasB) return false;
+  if (!hasA && !hasB && !hasM) return false;
 
-  if (hasA && hasB) {
-    // Weighted centroid: vægt = 1 / distance²
-    float dA = rssiToDistance(dev->aRssi);
-    float dB = rssiToDistance(dev->bRssi);
-    float wA = 1.0f / (dA * dA + 0.001f);
-    float wB = 1.0f / (dB * dB + 0.001f);
-    float total = wA + wB;
-    *outX = (wA * dev->axPos + wB * dev->bxPos) / total;
-    *outY = (wA * dev->ayPos + wB * dev->byPos) / total;
-  } else if (hasA) {
-    *outX = dev->axPos;
-    *outY = dev->ayPos;
-  } else {
-    *outX = dev->bxPos;
-    *outY = dev->byPos;
+  float totalW = 0;
+  float sumX   = 0;
+  float sumY   = 0;
+
+  auto addPoint = [&](float x, float y, int8_t rssi) {
+    float d = rssiToDistance(rssi);
+    float w = 1.0f / (d * d + 0.001f);
+    sumX   += w * x;
+    sumY   += w * y;
+    totalW += w;
+  };
+
+  if (hasA) addPoint(dev->axPos, dev->ayPos, dev->aRssi);
+  if (hasB) addPoint(dev->bxPos, dev->byPos, dev->bRssi);
+  if (hasM) addPoint(dev->mxPos, dev->myPos, dev->mRssi);
+
+  *outX = sumX / totalW;
+  *outY = sumY / totalW;
+  return true;
+}
+
+// ===================== SNIFFER (master lokal) =====================
+// ISR-safe queue — samme mønster som slave
+#define QUEUE_SIZE 32
+
+typedef struct {
+  uint8_t mac[6];
+  int8_t  rssi;
+} SniffEvent;
+
+static SniffEvent sniffQueue[QUEUE_SIZE];
+static volatile int qHead = 0;
+static volatile int qTail = 0;
+
+static inline bool qFull()  { return ((qTail + 1) % QUEUE_SIZE) == qHead; }
+static inline bool qEmpty() { return qHead == qTail; }
+
+typedef struct {
+  uint8_t frame_ctrl[2], duration[2], addr1[6], addr2[6], addr3[6], seq_ctrl[2];
+} wifi_ieee80211_mac_hdr_t;
+
+typedef struct {
+  wifi_ieee80211_mac_hdr_t hdr;
+  uint8_t payload[0];
+} wifi_ieee80211_packet_t;
+
+void IRAM_ATTR snifferCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
+  if (type != WIFI_PKT_MGMT && type != WIFI_PKT_DATA) return;
+  wifi_promiscuous_pkt_t*   pkt  = (wifi_promiscuous_pkt_t*)buf;
+  wifi_ieee80211_packet_t*  ipkt = (wifi_ieee80211_packet_t*)pkt->payload;
+  uint8_t* mac = ipkt->hdr.addr2;
+  if (mac[0] & 0x01) return;  // Broadcast
+  if (mac[0] & 0x02) return;  // Randomiseret
+  if (!qFull()) {
+    memcpy(sniffQueue[qTail].mac, mac, 6);
+    sniffQueue[qTail].rssi = pkt->rx_ctrl.rssi;
+    qTail = (qTail + 1) % QUEUE_SIZE;
+  }
+}
+
+// Throttle til master-sniffer
+#define THROTTLE_SLOTS 32
+typedef struct { char hash[9]; unsigned long lastSent; } ThrottleEntry;
+static ThrottleEntry throttleTable[THROTTLE_SLOTS];
+static int           throttleCount = 0;
+
+bool shouldProcess(const char* hash) {
+  unsigned long now = millis();
+  for (int i = 0; i < throttleCount; i++) {
+    if (strcmp(throttleTable[i].hash, hash) == 0) {
+      if (now - throttleTable[i].lastSent < THROTTLE_MS) return false;
+      throttleTable[i].lastSent = now;
+      return true;
+    }
+  }
+  if (throttleCount < THROTTLE_SLOTS) {
+    strncpy(throttleTable[throttleCount].hash, hash, 9);
+    throttleTable[throttleCount].lastSent = now;
+    throttleCount++;
   }
   return true;
 }
@@ -807,51 +880,37 @@ bool triangulate(DeviceEntry* dev, float* outX, float* outY) {
 static WiFiClientSecure tlsClient;
 static PubSubClient     mqttClient(tlsClient);
 
+static volatile uint8_t currentChannel = 1;
+
 // ===================== MQTT CALLBACK =====================
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
   if (length > 255) return;
-
   char buf[256];
   memcpy(buf, payload, length);
   buf[length] = '\0';
 
-  // Parse JSON
   StaticJsonDocument<256> doc;
-  DeserializationError err = deserializeJson(doc, buf);
-  if (err) {
-    Serial.printf("[MASTER] JSON fejl: %s\n", err.c_str());
-    return;
-  }
+  if (deserializeJson(doc, buf)) return;
 
   const char* macHash = doc["macHash"];
   int8_t      rssi    = doc["rssi"];
   float       sx      = doc["x"];
   float       sy      = doc["y"];
 
-  if (!macHash || rssi == 0) return;
-  if (rssi < MIN_RSSI) return;
+  if (!macHash || rssi == 0 || rssi < MIN_RSSI) return;
 
   DeviceEntry* dev = findOrCreate(macHash);
   unsigned long now = millis();
 
   if (strcmp(topic, TOPIC_SLAVE_A) == 0) {
-    dev->aRssi = rssi;
-    dev->axPos = sx;
-    dev->ayPos = sy;
-    dev->aTime = now;
+    dev->aRssi = rssi; dev->axPos = sx; dev->ayPos = sy; dev->aTime = now;
   } else if (strcmp(topic, TOPIC_SLAVE_B) == 0) {
-    dev->bRssi = rssi;
-    dev->bxPos = sx;
-    dev->byPos = sy;
-    dev->bTime = now;
+    dev->bRssi = rssi; dev->bxPos = sx; dev->byPos = sy; dev->bTime = now;
   }
 
-  // Forsøg triangulering
   float ex, ey;
   if (triangulate(dev, &ex, &ey)) {
-    dev->estX = ex;
-    dev->estY = ey;
-    dev->published = false;  // marker som klar til publish
+    dev->estX = ex; dev->estY = ey; dev->published = false;
   }
 }
 
@@ -868,10 +927,7 @@ void initWiFi() {
   WiFi.mode(WIFI_STA);
   WiFi.begin(SSID, WIFIPASSWORD);
   Serial.print("[WIFI] Forbinder");
-  while (WiFi.status() != WL_CONNECTED) {
-    Serial.print(".");
-    delay(500);
-  }
+  while (WiFi.status() != WL_CONNECTED) { Serial.print("."); delay(500); }
   Serial.println("\n[WIFI] Forbundet: " + WiFi.localIP().toString());
 }
 
@@ -885,7 +941,6 @@ void reconnectMQTT() {
       Serial.println("[MQTT] Forbundet!");
       mqttClient.subscribe(TOPIC_SLAVE_A);
       mqttClient.subscribe(TOPIC_SLAVE_B);
-      Serial.println("[MQTT] Abonnerer på slave topics");
     } else {
       Serial.printf("[MQTT] Fejlede, rc=%d — prøver igen om 5 sek\n", mqttClient.state());
       attempts++;
@@ -898,9 +953,8 @@ void reconnectMQTT() {
 void setup() {
   Serial.begin(115200);
   delay(200);
-
   Serial.println("========================================");
-  Serial.println("[BOOT] Master starter");
+  Serial.printf("[BOOT] Master starter @ (%.1f, %.1f)\n", MASTER_X, MASTER_Y);
   Serial.println("========================================");
 
   initWiFi();
@@ -909,7 +963,6 @@ void setup() {
   mqttClient.setServer(MQTT_HOST, MQTT_PORT);
   mqttClient.setBufferSize(512);
   mqttClient.setCallback(mqttCallback);
-
   reconnectMQTT();
 
   configTime(0, 0, "pool.ntp.org");
@@ -919,7 +972,13 @@ void setup() {
   Serial.println("[NTP] Tid synkroniseret");
 
   updateDailySalt();
-  Serial.printf("[MASTER] Dagligt salt sat: %s\n", dailySalt);
+  Serial.printf("[MASTER] Salt: %s\n", dailySalt);
+
+  // Start sniffer
+  esp_wifi_set_promiscuous(true);
+  esp_wifi_set_promiscuous_rx_cb(&snifferCallback);
+  esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+  Serial.println("[SNIFFER] Kørende");
   Serial.println("========================================");
 }
 
@@ -934,7 +993,7 @@ void loop() {
   }
   mqttClient.loop();
 
-  // Opdater dagligt salt ved midnat
+  // Opdater dagligt salt
   if (millis() - lastSaltCheck > 60000) {
     lastSaltCheck = millis();
     struct tm t;
@@ -945,38 +1004,70 @@ void loop() {
     }
   }
 
+  // Drain master sniffer queue
+  while (!qEmpty()) {
+    SniffEvent evt = sniffQueue[qHead];
+    qHead = (qHead + 1) % QUEUE_SIZE;
+
+    char macHash[9];
+    macToHash(evt.mac, macHash);
+
+    if (!shouldProcess(macHash)) continue;
+
+    DeviceEntry* dev = findOrCreate(macHash);
+    dev->mRssi = evt.rssi;
+    dev->mxPos = MASTER_X;
+    dev->myPos = MASTER_Y;
+    dev->mTime = millis();
+
+    float ex, ey;
+    if (triangulate(dev, &ex, &ey)) {
+      dev->estX = ex; dev->estY = ey; dev->published = false;
+    }
+  }
+
   // Publish klar-til-send entries
   for (int i = 0; i < deviceCount; i++) {
     if (!devices[i].published && mqttClient.connected()) {
       char payload[192];
       snprintf(payload, sizeof(payload),
         "{\"devId\":\"%s\",\"x\":%.2f,\"y\":%.2f,\"ts\":\"%s\"}",
-        devices[i].devId,
-        devices[i].estX,
-        devices[i].estY,
+        devices[i].devId, devices[i].estX, devices[i].estY,
         getTimestamp().c_str());
-
       mqttClient.publish(TOPIC_POSITIONS, payload);
       devices[i].published = true;
-
-      Serial.printf("[MASTER] Publiceret: %s @ (%.2f, %.2f)\n",
+      Serial.printf("[MASTER] %s @ (%.2f, %.2f)\n",
         devices[i].devId, devices[i].estX, devices[i].estY);
     }
   }
 
-  // Ryd gamle entries der ikke er set i mere end 30 sekunder
+  // Ryd enheder ikke set i 30 sek
   unsigned long now = millis();
   for (int i = 0; i < deviceCount; i++) {
-    unsigned long newest = max(devices[i].aTime, devices[i].bTime);
+    unsigned long newest = max({devices[i].aTime, devices[i].bTime, devices[i].mTime});
     if (newest > 0 && (now - newest) > 30000) {
-      // Flyt sidste element ind på denne plads
       devices[i] = devices[deviceCount - 1];
       memset(&devices[deviceCount - 1], 0, sizeof(DeviceEntry));
       deviceCount--;
       i--;
     }
   }
+
+  // Channel hopping — kanal 1, 6, 11
+  static const uint8_t channels[] = {1, 6, 11};
+  static uint8_t       channelIdx = 0;
+  static unsigned long lastHop    = 0;
+
+  if (millis() - lastHop > 150) {
+    channelIdx     = (channelIdx + 1) % 3;
+    currentChannel = channels[channelIdx];
+    esp_wifi_set_promiscuous(false);
+    esp_wifi_set_channel(currentChannel, WIFI_SECOND_CHAN_NONE);
+    esp_wifi_set_promiscuous(true);
+    lastHop = millis();
+  }
 }
+
 ```
 
 ## Heatmap men mangler websocket port til mqtt-server
@@ -1294,18 +1385,19 @@ client.on('error', (e) => console.log('Fejl:', e));
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
       <div class="field" style="margin:0">
         <label>Bredde</label>
-        <input id="inp-rw" type="number" value="10" min="1" max="100">
+        <input id="inp-rw" type="number" value="5" min="1" max="100">
       </div>
       <div class="field" style="margin:0">
         <label>Dybde</label>
-        <input id="inp-rh" type="number" value="8" min="1" max="100">
+        <input id="inp-rh" type="number" value="4" min="1" max="100">
       </div>
     </div>
   </div>
 
   <div class="sidebar-section">
     <h2>Enheder <span id="dev-count" style="color:var(--accent);font-size:12px"></span></h2>
-    <div class="slave-tag"><span class="slave-icon"></span> Slave-position</div>
+    <div class="slave-tag"><span class="slave-icon" style="background:#f59e0b"></span> Slave</div>
+    <div class="slave-tag"><span class="slave-icon" style="background:#a78bfa"></span> Master</div>
   </div>
 
   <div id="device-list"></div>
@@ -1321,10 +1413,11 @@ const FADE_MS      = 15000;  // Enhed forsvinder efter 15 sek uden opdatering
 const HEATMAP_DECAY = 0.97;  // Heatmap falmer langsomt (pr. frame)
 const DOT_RADIUS   = 14;     // Pixels
 
-// Slave-positioner i meter — skal matche SLAVE_X/SLAVE_Y i config.h
+// Sensor-positioner i meter — skal matche config.h og MASTER_X/MASTER_Y
 const SLAVES = [
-  { id: 'slaveA', x: 0.0, y: 0.0, color: '#f59e0b' },
-  { id: 'slaveB', x: 5.0, y: 0.0, color: '#f59e0b' },
+  { id: 'slaveA',  x: 0.0, y: 0.0, color: '#f59e0b' },
+  { id: 'slaveB',  x: 5.0, y: 0.0, color: '#f59e0b' },
+  { id: 'master',  x: 0.0, y: 4.0, color: '#a78bfa' },
 ];
 
 // ── STATE ────────────────────────────────────────────────────
@@ -1586,6 +1679,7 @@ requestAnimationFrame(draw);
 </script>
 </body>
 </html>
+
 
 ```
 
