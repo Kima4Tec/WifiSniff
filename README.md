@@ -7,7 +7,7 @@ Der findes flere metoder til at estimere position uden brug af GPS. I dette proj
 ### Dag 1
 Vi fandt ud at sniffe os til flere forskellige enheder i nærheden. Havde tanker på sikkerhed med hashing. Vi opsatte en mqtt server på pc. Herefter satte vi programmet til at søge på specifikke mobiler, med kendte mac-adresser.
 ### Dag 2
-Vi er gået videre med vores sniffer-program, der bruger mqtt-serveren som modtager af de tre esp32s data med en broker (program skrevet i python), som samler data fra de tre esp32 og udregner afstand til kendt mobil vha trilaterering. 
+Vi er gået videre med vores sniffer-program, der bruger mqtt-serveren som modtager af de tre esp32s data med en broker (program skrevet i python), som samler data fra de tre esp32 og udregner afstand til kendt mobil vha trilateration. 
 Vi krypterer alle fundne mac-adresser med hashing, og da vi fandt ud af, at det ikke er sikkert nok, har vi også saltet disse data. Vi har finder kun afstand fra en kendt mobil og registrerer desuden antal af fundne devices uden at bruge deres mac-adresser.
 Vi opstartede desuden nyt projekt, hvor vi undersøger mulighederne med esp-now. 
 
@@ -20,11 +20,11 @@ Vi opstartede desuden nyt projekt, hvor vi undersøger mulighederne med esp-now.
 
 | Teknologi | Hvordan virker det? | Fordele | Ulemper | Egnet til projektet? |
 |---|---|---|---|---|
-| ESP32 → MQTT → Broker → Trilaterering | Alle ESP32-enheder sniffer WiFi-signaler og sender RSSI-data direkte til MQTT-server. Broker/backend udregner position via trilateration. | Simpel arkitektur, let debugging, central databehandling, nem visualisering, god skalerbarhed, let at integrere med dashboards/databaser | Kræver WiFi-netværk og broker, flere MQTT-forbindelser, mere netværkstrafik, backend skal samle alle målinger | Ja – meget god og stabil løsning |
+| ESP32 → MQTT → Broker → trilateration | Alle ESP32-enheder sniffer WiFi-signaler og sender RSSI-data direkte til MQTT-server. Broker/backend udregner position via trilateration. | Simpel arkitektur, let debugging, central databehandling, nem visualisering, god skalerbarhed, let at integrere med dashboards/databaser | Kræver WiFi-netværk og broker, flere MQTT-forbindelser, mere netværkstrafik, backend skal samle alle målinger | Ja – meget god og stabil løsning |
 | ESP-NOW + Master ESP32 + MQTT | Slave-ESP32’er sender RSSI-data til en master via ESP-NOW. Master samler data og sender til MQTT. | Lav latency, mindre netværkstrafik, kun én MQTT-forbindelse, fungerer uden router mellem ESP32’er, mere professionel edge/gateway-arkitektur | Mere kompleks kode, ESP-NOW kræver samme WiFi-kanal, begrænset rækkevidde, sværere debugging | Ja – meget stærk løsning til projektet |
 | ESP-MESH | ESP32’er danner selvorganiserende mesh-netværk og videresender data mellem noder til root-node | Stor rækkevidde, selvhelende netværk, god til store områder, robust mod node-fejl | Kompleks opsætning, højere latency, mere RAM/CPU-forbrug, svær debugging | Muligt, men ofte overkill til mindre projekter |
 | RTT (Round Trip Time) | Måler tiden et signal bruger på at rejse mellem enheder og tilbage igen | Potentielt mere præcis afstandsbestemmelse end RSSI | ESP32 understøtter ikke præcis hardware-timing til RTT/Fine Timing Measurement (FTM), meget vanskelig implementering, kræver synkronisering | Ikke realistisk til dette projekt |
-| RSSI-trilaterering | Afstand estimeres ud fra signalstyrke (RSSI), hvorefter position beregnes geometrisk | Simpel implementering, virker med standard ESP32 hardware, ingen aktiv forbindelse nødvendig | Lav præcision, påvirkes af vægge, mennesker og støj, signalstyrke varierer meget | Ja – mest realistiske metode med ESP32 |
+| RSSI-trilateration | Afstand estimeres ud fra signalstyrke (RSSI), hvorefter position beregnes geometrisk | Simpel implementering, virker med standard ESP32 hardware, ingen aktiv forbindelse nødvendig | Lav præcision, påvirkes af vægge, mennesker og støj, signalstyrke varierer meget | Ja – mest realistiske metode med ESP32 |
 
 
 Valget faldt først på direkte mqtt-arkitektur
@@ -40,7 +40,7 @@ Valget faldt først på direkte mqtt-arkitektur
    * mindre netværkstrafik
    * mere interessant arkitektur
 
-RTT er teoretisk mere præcist, men praktisk svært eller umuligt med almindelige ESP32-enheder. Derfor bruges RSSI-trilaterering typisk i skoleprojekter og simple indoor positioning-systemer.
+RTT er teoretisk mere præcist, men praktisk svært eller umuligt med almindelige ESP32-enheder. Derfor bruges RSSI-trilateration typisk i skoleprojekter og simple indoor positioning-systemer.
 
 ---
 
@@ -85,9 +85,9 @@ RSSI fungerer derfor bedst til:
 
 ---
 
-# trilaterering / Trilateration
+# Trilateration
 
-trilaterering bruges til at finde en position ved hjælp af flere kendte målepunkter.
+trilateration bruges til at finde en position ved hjælp af flere kendte målepunkter.
 
 ## Hvordan virker det?
 Tre eller flere ESP32-enheder placeres på kendte koordinater:
@@ -502,7 +502,7 @@ DeviceEntry* findOrCreate(const char* macHash) {
   return e;
 }
 
-// ===================== trilaterering =====================
+// ===================== trilateration =====================
 // Weighted centroid fra op til 3 punkter
 // Vægt = 1 / distance² — stærkt signal trækker mere
 
@@ -903,7 +903,7 @@ DeviceEntry* findOrCreate(const char* macHash) {
   return e;
 }
 
-// ===================== trilaterering =====================
+// ===================== trilateration =====================
 // Weighted centroid fra op til 3 punkter
 // Vægt = 1 / distance² — stærkt signal trækker mere
 
