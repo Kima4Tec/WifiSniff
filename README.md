@@ -686,6 +686,11 @@ void loop() {
 #define MAX_DEVICES  40
 #define THROTTLE_MS  500   // Maks én måling per enhed per interval (master sniffer)
 
+// Lås masteren til routerens kanal — find det i din routers admin-panel
+// Kanal hopping fjernet fra master da det destabiliserer WiFi/MQTT forbindelsen
+// Slaverne dækker kanal 1, 6 og 11
+#define ROUTER_CHANNEL 6
+
 // ===================== DAGLIGT SALT =====================
 static char dailySalt[16] = "SALT_INIT";
 
@@ -880,8 +885,6 @@ bool shouldProcess(const char* hash) {
 static WiFiClientSecure tlsClient;
 static PubSubClient     mqttClient(tlsClient);
 
-static volatile uint8_t currentChannel = 1;
-
 // ===================== MQTT CALLBACK =====================
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
   if (length > 255) return;
@@ -974,11 +977,11 @@ void setup() {
   updateDailySalt();
   Serial.printf("[MASTER] Salt: %s\n", dailySalt);
 
-  // Start sniffer
+  // Start sniffer — låst til routerens kanal for stabilt WiFi/MQTT
   esp_wifi_set_promiscuous(true);
   esp_wifi_set_promiscuous_rx_cb(&snifferCallback);
-  esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
-  Serial.println("[SNIFFER] Kørende");
+  esp_wifi_set_channel(ROUTER_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  Serial.printf("[SNIFFER] Kørende på kanal %d\n", ROUTER_CHANNEL);
   Serial.println("========================================");
 }
 
@@ -1053,21 +1056,7 @@ void loop() {
     }
   }
 
-  // Channel hopping — kanal 1, 6, 11
-  static const uint8_t channels[] = {1, 6, 11};
-  static uint8_t       channelIdx = 0;
-  static unsigned long lastHop    = 0;
-
-  if (millis() - lastHop > 150) {
-    channelIdx     = (channelIdx + 1) % 3;
-    currentChannel = channels[channelIdx];
-    esp_wifi_set_promiscuous(false);
-    esp_wifi_set_channel(currentChannel, WIFI_SECOND_CHAN_NONE);
-    esp_wifi_set_promiscuous(true);
-    lastHop = millis();
-  }
 }
-
 
 ```
 
