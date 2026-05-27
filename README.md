@@ -383,28 +383,61 @@ Sikkerheden øges markant sammenlignet med ren SHA-256 hashing.
 ```
 #include "Arduino.h"
 #include "esp_wifi.h"
-#include "esp_event.h"
-#include "nvs_flash.h"
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <WiFiClientSecure.h>
 #include <mbedtls/md.h>
+#include <ArduinoJson.h>
 #include "secrets.h"   // SSID, WIFIPASSWORD, MQTT_HOST, MQTT_PORT, MQTT_USER, MQTT_PASS
 #include "config.h"    // DEVICENAME
 #include "ca_cert.h"   // MQTT_CA_CERT
 
 // ===================== CONFIG =====================
-// Sæt dette til "slaveA" eller "slaveB" i config.h som SLAVE_ID
-// Topic bliver: /sensors/raw/slaveA  eller  /sensors/raw/slaveB
-#define MQTT_TOPIC_PREFIX "devices/device03/raw/"
+#define TOPIC_SLAVE_A    "devices/device03/raw/slaveA"
+#define TOPIC_SLAVE_B    "devices/device03/raw/slaveB"
+#define TOPIC_POSITIONS  "devices/device03/positions"
 
-// Slave-position i rummet (meter) — sæt i config.h som SLAVE_X og SLAVE_Y
-// Bruges af master til triangulering
-// Eks: slaveA = (0.0, 0.0), slaveB = (5.0, 0.0)
+// Master-position i rummet (meter)
+#define MASTER_X   0.0f
+#define MASTER_Y   5.0f
+
+#define WINDOW_MS   2000   // Tidsvindue for at kombinere målinger (ms)
+#define MIN_RSSI    -85    // Svageste signal der accepteres
+#define MAX_DEVICES  40
+#define THROTTLE_MS  500   // Maks én måling per enhed per interval (master sniffer)
+
+// Lås masteren til routerens kanal — find det i din routers admin-panel
+// Kanal hopping fjernet fra master da det destabiliserer WiFi/MQTT forbindelsen
+// Slaverne dækker kanal 1, 6 og 11
+#define ROUTER_CHANNEL 6
+
+// ===================== DAGLIGT SALT =====================
+static char dailySalt[16] = "SALT_INIT";
+
+void updateDailySalt() {
+  struct tm t;
+  if (getLocalTime(&t)) {
+    snprintf(dailySalt, sizeof(dailySalt), "%04d%02d%02d",
+      t.tm_year + 1900, t.tm_mon + 1, t.tm_mday);
+  }
+}
+
+// ===================== ANONYMISERING =====================
+void makeDevId(const char* macHash, char* outDevId) {
+  char input[32];
+  snprintf(input, sizeof(input), "%s%s", macHash, dailySalt);
+  uint8_t digest[32];
+  mbedtls_md_context_t ctx;
+  mbedtls_md_init(&ctx);
+  mbedtls_md_setup(&ctx, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), 0);
+  mbedtls_md_starts(&ctx);
+  mbedtls_md_update(&ctx, (const uint8_t*)input, strlen(input));
+  mbedtls_md_finish(&ctx, digest);
+  mbedtls_md_free(&ctx);
+  snprintf(outDevId, 10, "DEV-%02X%02X", digest[0], digest[1]);
+}
 
 // ===================== MAC HASH =====================
-// SHA256(MAC) → hex-streng, kun de første 8 tegn bruges som kortID
-// Rå MAC forlader aldrig enheden
 void macToHash(const uint8_t* mac, char* outHex8) {
   uint8_t digest[32];
   mbedtls_md_context_t ctx;
@@ -414,55 +447,144 @@ void macToHash(const uint8_t* mac, char* outHex8) {
   mbedtls_md_update(&ctx, mac, 6);
   mbedtls_md_finish(&ctx, digest);
   mbedtls_md_free(&ctx);
-  // Kun de første 4 bytes (8 hex-tegn) — kort nok til ikke at være identificerbart
   snprintf(outHex8, 9, "%02X%02X%02X%02X",
     digest[0], digest[1], digest[2], digest[3]);
 }
 
-// ===================== DETECTION QUEUE =====================
-#define QUEUE_SIZE 32
-
+// ===================== DEVICE TABLE =====================
 typedef struct {
-  char    macHash[9];   // 8 hex chars + null
-  int8_t  rssi;
-} DetectionEvent;
+  char          macHash[9];
+  char          devId[10];
 
-static DetectionEvent eventQueue[QUEUE_SIZE];
-static volatile int   queueHead = 0;
-static volatile int   queueTail = 0;
+  // Slave A måling
+  float         axPos, ayPos;
+  int8_t        aRssi;
+  unsigned long aTime;
 
-static inline bool queueFull()  { return ((queueTail + 1) % QUEUE_SIZE) == queueHead; }
-static inline bool queueEmpty() { return queueHead == queueTail; }
+  // Slave B måling
+  float         bxPos, byPos;
+  int8_t        bRssi;
+  unsigned long bTime;
 
-static inline void enqueueEvent(const char* hash, int8_t rssi) {
-  if (!queueFull()) {
-    strncpy(eventQueue[queueTail].macHash, hash, 9);
-    eventQueue[queueTail].rssi = rssi;
-    queueTail = (queueTail + 1) % QUEUE_SIZE;
+  // Master (lokal) måling
+  float         mxPos, myPos;
+  int8_t        mRssi;
+  unsigned long mTime;
+
+  // Beregnet position
+  float         estX, estY;
+  bool          published;
+} DeviceEntry;
+
+static DeviceEntry devices[MAX_DEVICES];
+static int         deviceCount = 0;
+
+DeviceEntry* findOrCreate(const char* macHash) {
+  for (int i = 0; i < deviceCount; i++) {
+    if (strcmp(devices[i].macHash, macHash) == 0) return &devices[i];
   }
+  if (deviceCount >= MAX_DEVICES) {
+    int oldest = 0;
+    unsigned long minTime = ULONG_MAX;
+    for (int i = 0; i < MAX_DEVICES; i++) {
+      unsigned long t = max({devices[i].aTime, devices[i].bTime, devices[i].mTime});
+      if (t < minTime) { minTime = t; oldest = i; }
+    }
+    memset(&devices[oldest], 0, sizeof(DeviceEntry));
+    strncpy(devices[oldest].macHash, macHash, 9);
+    makeDevId(macHash, devices[oldest].devId);
+    return &devices[oldest];
+  }
+  DeviceEntry* e = &devices[deviceCount++];
+  memset(e, 0, sizeof(DeviceEntry));
+  strncpy(e->macHash, macHash, 9);
+  makeDevId(macHash, e->devId);
+  return e;
 }
 
-static bool dequeueEvent(DetectionEvent* out) {
-  if (queueEmpty()) return false;
-  *out = eventQueue[queueHead];
-  queueHead = (queueHead + 1) % QUEUE_SIZE;
+// ===================== TRIANGULERING =====================
+// Weighted centroid fra op til 3 punkter
+// Vægt = 1 / distance² — stærkt signal trækker mere
+
+float rssiToDistance(int8_t rssi, int txPower = -59, float n = 2.5) {
+  return pow(10.0f, (txPower - rssi) / (10.0f * n));
+}
+
+bool triangulate(DeviceEntry* dev, float* outX, float* outY) {
+  unsigned long now = millis();
+  bool hasA = (dev->aTime > 0) && ((now - dev->aTime) < WINDOW_MS) && (dev->aRssi > MIN_RSSI);
+  bool hasB = (dev->bTime > 0) && ((now - dev->bTime) < WINDOW_MS) && (dev->bRssi > MIN_RSSI);
+  bool hasM = (dev->mTime > 0) && ((now - dev->mTime) < WINDOW_MS) && (dev->mRssi > MIN_RSSI);
+
+  if (!hasA && !hasB && !hasM) return false;
+
+  float totalW = 0;
+  float sumX   = 0;
+  float sumY   = 0;
+
+  auto addPoint = [&](float x, float y, int8_t rssi) {
+    float d = rssiToDistance(rssi);
+    float w = 1.0f / (d * d + 0.001f);
+    sumX   += w * x;
+    sumY   += w * y;
+    totalW += w;
+  };
+
+  if (hasA) addPoint(dev->axPos, dev->ayPos, dev->aRssi);
+  if (hasB) addPoint(dev->bxPos, dev->byPos, dev->bRssi);
+  if (hasM) addPoint(dev->mxPos, dev->myPos, dev->mRssi);
+
+  *outX = sumX / totalW;
+  *outY = sumY / totalW;
   return true;
 }
 
-// ===================== RSSI THROTTLE =====================
-// Undgå at oversvømme brokeren — send maks én måling per enhed per interval
-#define THROTTLE_MS     500
-#define THROTTLE_SLOTS  32
+// ===================== SNIFFER (master lokal) =====================
+// ISR-safe queue — samme mønster som slave
+#define QUEUE_SIZE 32
 
 typedef struct {
-  char hash[9];
-  unsigned long lastSent;
-} ThrottleEntry;
+  uint8_t mac[6];
+  int8_t  rssi;
+} SniffEvent;
 
+static SniffEvent sniffQueue[QUEUE_SIZE];
+static volatile int qHead = 0;
+static volatile int qTail = 0;
+
+static inline bool qFull()  { return ((qTail + 1) % QUEUE_SIZE) == qHead; }
+static inline bool qEmpty() { return qHead == qTail; }
+
+typedef struct {
+  uint8_t frame_ctrl[2], duration[2], addr1[6], addr2[6], addr3[6], seq_ctrl[2];
+} wifi_ieee80211_mac_hdr_t;
+
+typedef struct {
+  wifi_ieee80211_mac_hdr_t hdr;
+  uint8_t payload[0];
+} wifi_ieee80211_packet_t;
+
+void IRAM_ATTR snifferCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
+  if (type != WIFI_PKT_MGMT && type != WIFI_PKT_DATA) return;
+  wifi_promiscuous_pkt_t*   pkt  = (wifi_promiscuous_pkt_t*)buf;
+  wifi_ieee80211_packet_t*  ipkt = (wifi_ieee80211_packet_t*)pkt->payload;
+  uint8_t* mac = ipkt->hdr.addr2;
+  if (mac[0] & 0x01) return;  // Broadcast
+  if (mac[0] & 0x02) return;  // Randomiseret
+  if (!qFull()) {
+    memcpy(sniffQueue[qTail].mac, mac, 6);
+    sniffQueue[qTail].rssi = pkt->rx_ctrl.rssi;
+    qTail = (qTail + 1) % QUEUE_SIZE;
+  }
+}
+
+// Throttle til master-sniffer
+#define THROTTLE_SLOTS 32
+typedef struct { char hash[9]; unsigned long lastSent; } ThrottleEntry;
 static ThrottleEntry throttleTable[THROTTLE_SLOTS];
 static int           throttleCount = 0;
 
-bool shouldSend(const char* hash) {
+bool shouldProcess(const char* hash) {
   unsigned long now = millis();
   for (int i = 0; i < throttleCount; i++) {
     if (strcmp(throttleTable[i].hash, hash) == 0) {
@@ -471,7 +593,6 @@ bool shouldSend(const char* hash) {
       return true;
     }
   }
-  // Ny enhed
   if (throttleCount < THROTTLE_SLOTS) {
     strncpy(throttleTable[throttleCount].hash, hash, 9);
     throttleTable[throttleCount].lastSent = now;
@@ -480,65 +601,48 @@ bool shouldSend(const char* hash) {
   return true;
 }
 
-// ===================== TIMESTAMP =====================
-String getTimestamp() {
-  struct tm timeinfo;
-  char buf[30] = "unknown";
-  if (getLocalTime(&timeinfo)) {
-    strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S", &timeinfo);
-  }
-  return String(buf);
-}
-
 // ===================== MQTT =====================
 static WiFiClientSecure tlsClient;
 static PubSubClient     mqttClient(tlsClient);
 
-static volatile uint8_t currentChannel = 1;
+// ===================== MQTT CALLBACK =====================
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  if (length > 255) return;
+  char buf[256];
+  memcpy(buf, payload, length);
+  buf[length] = '\0';
 
-// ===================== WIFI IEEE80211 STRUCTS =====================
-typedef struct {
-  uint8_t frame_ctrl[2];
-  uint8_t duration[2];
-  uint8_t addr1[6];
-  uint8_t addr2[6];
-  uint8_t addr3[6];
-  uint8_t seq_ctrl[2];
-} wifi_ieee80211_mac_hdr_t;
+  StaticJsonDocument<256> doc;
+  if (deserializeJson(doc, buf)) return;
 
-typedef struct {
-  wifi_ieee80211_mac_hdr_t hdr;
-  uint8_t payload[0];
-} wifi_ieee80211_packet_t;
+  const char* macHash = doc["macHash"];
+  int8_t      rssi    = doc["rssi"];
+  float       sx      = doc["x"];
+  float       sy      = doc["y"];
 
-// ===================== SNIFFER CALLBACK =====================
-// Kører i ISR-kontekst — ingen Serial, ingen MQTT, ingen heap-allokering
-void IRAM_ATTR snifferCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
-  if (type != WIFI_PKT_MGMT && type != WIFI_PKT_DATA) return;
+  if (!macHash || rssi == 0 || rssi < MIN_RSSI) return;
 
-  wifi_promiscuous_pkt_t*   pkt  = (wifi_promiscuous_pkt_t*)buf;
-  wifi_ieee80211_packet_t*  ipkt = (wifi_ieee80211_packet_t*)pkt->payload;
-  wifi_ieee80211_mac_hdr_t* hdr  = &ipkt->hdr;
+  DeviceEntry* dev = findOrCreate(macHash);
+  unsigned long now = millis();
 
-  uint8_t* mac = hdr->addr2;
-
-  // Filtrer broadcast, multicast og locally-administered (randomiserede) MAC'er
-  if (mac[0] & 0x01) return;  // Broadcast/multicast
-  if (mac[0] & 0x02) return;  // Locally-administered (randomiseret)
-
-  int8_t rssi = pkt->rx_ctrl.rssi;
-
-  // Hash i ISR er tungt — brug en lille statisk buffer
-  // Vi sender raw mac bytes til queue og hasher i loop()
-  // For at undgå heap: pack mac i 6 bytes + rssi
-  if (!queueFull()) {
-    // Gem rå MAC midlertidigt — hashes i loop() uden for ISR
-    // Vi genbruger macHash-feltet til rå bytes (første 6 bytes)
-    memcpy(eventQueue[queueTail].macHash, mac, 6);
-    eventQueue[queueTail].macHash[6] = '\0';  // markér som rå
-    eventQueue[queueTail].rssi = rssi;
-    queueTail = (queueTail + 1) % QUEUE_SIZE;
+  if (strcmp(topic, TOPIC_SLAVE_A) == 0) {
+    dev->aRssi = rssi; dev->axPos = sx; dev->ayPos = sy; dev->aTime = now;
+  } else if (strcmp(topic, TOPIC_SLAVE_B) == 0) {
+    dev->bRssi = rssi; dev->bxPos = sx; dev->byPos = sy; dev->bTime = now;
   }
+
+  float ex, ey;
+  if (triangulate(dev, &ex, &ey)) {
+    dev->estX = ex; dev->estY = ey; dev->published = false;
+  }
+}
+
+// ===================== TIMESTAMP =====================
+String getTimestamp() {
+  struct tm t;
+  char buf[30] = "unknown";
+  if (getLocalTime(&t)) strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S", &t);
+  return String(buf);
 }
 
 // ===================== WIFI =====================
@@ -546,10 +650,7 @@ void initWiFi() {
   WiFi.mode(WIFI_STA);
   WiFi.begin(SSID, WIFIPASSWORD);
   Serial.print("[WIFI] Forbinder");
-  while (WiFi.status() != WL_CONNECTED) {
-    Serial.print(".");
-    delay(500);
-  }
+  while (WiFi.status() != WL_CONNECTED) { Serial.print("."); delay(500); }
   Serial.println("\n[WIFI] Forbundet: " + WiFi.localIP().toString());
 }
 
@@ -558,17 +659,16 @@ void reconnectMQTT() {
   int attempts = 0;
   while (!mqttClient.connected() && attempts < 5) {
     Serial.printf("[MQTT] Forbinder til %s:%d ...\n", MQTT_HOST, MQTT_PORT);
-    String clientId = String(SLAVE_ID) + "-" + String(random(0xffff), HEX);
+    String clientId = "Master-" + String(random(0xffff), HEX);
     if (mqttClient.connect(clientId.c_str(), MQTT_USER, MQTT_PASS)) {
       Serial.println("[MQTT] Forbundet!");
+      mqttClient.subscribe(TOPIC_SLAVE_A);
+      mqttClient.subscribe(TOPIC_SLAVE_B);
     } else {
       Serial.printf("[MQTT] Fejlede, rc=%d — prøver igen om 5 sek\n", mqttClient.state());
       attempts++;
       delay(5000);
     }
-  }
-  if (!mqttClient.connected()) {
-    Serial.println("[MQTT] Kunne ikke forbinde — fortsætter uden MQTT");
   }
 }
 
@@ -576,18 +676,16 @@ void reconnectMQTT() {
 void setup() {
   Serial.begin(115200);
   delay(200);
-
   Serial.println("========================================");
-  Serial.printf("[BOOT] %s starter (slave: %s)\n", DEVICENAME, SLAVE_ID);
-  Serial.printf("[BOOT] Position: (%.1f, %.1f)\n", (float)SLAVE_X, (float)SLAVE_Y);
+  Serial.printf("[BOOT] Master starter @ (%.1f, %.1f)\n", MASTER_X, MASTER_Y);
   Serial.println("========================================");
 
   initWiFi();
 
   tlsClient.setCACert(MQTT_CA_CERT);
   mqttClient.setServer(MQTT_HOST, MQTT_PORT);
-  mqttClient.setBufferSize(256);
-
+  mqttClient.setBufferSize(512);
+  mqttClient.setCallback(mqttCallback);
   reconnectMQTT();
 
   configTime(0, 0, "pool.ntp.org");
@@ -596,15 +694,21 @@ void setup() {
   delay(1500);
   Serial.println("[NTP] Tid synkroniseret");
 
+  updateDailySalt();
+  Serial.printf("[MASTER] Salt: %s\n", dailySalt);
+
+  // Start sniffer — låst til routerens kanal for stabilt WiFi/MQTT
   esp_wifi_set_promiscuous(true);
   esp_wifi_set_promiscuous_rx_cb(&snifferCallback);
-  esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
-
-  Serial.println("[SNIFFER] Kørende");
+  esp_wifi_set_channel(ROUTER_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  Serial.printf("[SNIFFER] Kørende på kanal %d\n", ROUTER_CHANNEL);
   Serial.println("========================================");
 }
 
 // ===================== LOOP =====================
+static unsigned long lastSaltCheck = 0;
+static int           lastDay       = -1;
+
 void loop() {
   if (!mqttClient.connected()) {
     Serial.println("[MQTT] Forbindelse tabt — genopretter...");
@@ -612,49 +716,66 @@ void loop() {
   }
   mqttClient.loop();
 
-  // Drain queue — hash MAC og publish
-  while (!queueEmpty()) {
-    DetectionEvent evt;
-    evt = eventQueue[queueHead];
-    queueHead = (queueHead + 1) % QUEUE_SIZE;
-
-    // Hash de 6 rå MAC-bytes
-    char macHash[9];
-    macToHash((const uint8_t*)evt.macHash, macHash);
-
-    // Throttle — undgå flood
-    if (!shouldSend(macHash)) continue;
-
-    Serial.printf("[SNIFFER] Hash: %s  RSSI: %d dBm  Kanal: %d\n",
-      macHash, evt.rssi, currentChannel);
-
-    if (mqttClient.connected()) {
-      char topic[64];
-      snprintf(topic, sizeof(topic), "%s%s", MQTT_TOPIC_PREFIX, SLAVE_ID);
-
-      char payload[192];
-      snprintf(payload, sizeof(payload),
-        "{\"slave\":\"%s\",\"x\":%.2f,\"y\":%.2f,\"macHash\":\"%s\",\"rssi\":%d,\"ts\":\"%s\"}",
-        SLAVE_ID, (float)SLAVE_X, (float)SLAVE_Y,
-        macHash, evt.rssi, getTimestamp().c_str());
-
-      mqttClient.publish(topic, payload);
+  // Opdater dagligt salt
+  if (millis() - lastSaltCheck > 60000) {
+    lastSaltCheck = millis();
+    struct tm t;
+    if (getLocalTime(&t) && t.tm_mday != lastDay) {
+      lastDay = t.tm_mday;
+      updateDailySalt();
+      Serial.printf("[MASTER] Salt opdateret: %s\n", dailySalt);
     }
   }
 
-  // Channel hopping — 1, 6, 11 (de tre primære kanaler)
-  static const uint8_t channels[] = {1, 6, 11};
-  static uint8_t       channelIdx = 0;
-  static unsigned long lastHop    = 0;
+  // Drain master sniffer queue
+  while (!qEmpty()) {
+    SniffEvent evt = sniffQueue[qHead];
+    qHead = (qHead + 1) % QUEUE_SIZE;
 
-  if (millis() - lastHop > 150) {
-    channelIdx   = (channelIdx + 1) % 3;
-    currentChannel = channels[channelIdx];
-    esp_wifi_set_promiscuous(false);
-    esp_wifi_set_channel(currentChannel, WIFI_SECOND_CHAN_NONE);
-    esp_wifi_set_promiscuous(true);
-    lastHop = millis();
+    char macHash[9];
+    macToHash(evt.mac, macHash);
+
+    if (!shouldProcess(macHash)) continue;
+
+    DeviceEntry* dev = findOrCreate(macHash);
+    dev->mRssi = evt.rssi;
+    dev->mxPos = MASTER_X;
+    dev->myPos = MASTER_Y;
+    dev->mTime = millis();
+
+    float ex, ey;
+    if (triangulate(dev, &ex, &ey)) {
+      dev->estX = ex; dev->estY = ey; dev->published = false;
+    }
   }
+
+  // Publish klar-til-send entries
+  for (int i = 0; i < deviceCount; i++) {
+    if (!devices[i].published && mqttClient.connected()) {
+      char payload[192];
+      snprintf(payload, sizeof(payload),
+        "{\"devId\":\"%s\",\"x\":%.2f,\"y\":%.2f,\"ts\":\"%s\"}",
+        devices[i].devId, devices[i].estX, devices[i].estY,
+        getTimestamp().c_str());
+      mqttClient.publish(TOPIC_POSITIONS, payload);
+      devices[i].published = true;
+      Serial.printf("[MASTER] %s @ (%.2f, %.2f)\n",
+        devices[i].devId, devices[i].estX, devices[i].estY);
+    }
+  }
+
+  // Ryd enheder ikke set i 30 sek
+  unsigned long now = millis();
+  for (int i = 0; i < deviceCount; i++) {
+    unsigned long newest = max({devices[i].aTime, devices[i].bTime, devices[i].mTime});
+    if (newest > 0 && (now - newest) > 30000) {
+      devices[i] = devices[deviceCount - 1];
+      memset(&devices[deviceCount - 1], 0, sizeof(DeviceEntry));
+      deviceCount--;
+      i--;
+    }
+  }
+
 }
 
 ```
